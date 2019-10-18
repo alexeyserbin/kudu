@@ -68,6 +68,8 @@ const Cache::IterationFunc Cache::kIterateOverAllEntriesFunc = [](
 
 namespace {
 
+typedef simple_spinlock MutexType;
+
 // Recency list cache implementations (FIFO, LRU, etc.)
 
 // Recency list handle. An entry is a variable length heap-allocated structure.
@@ -266,7 +268,7 @@ class CacheShard {
   size_t capacity_;
 
   // mutex_ protects the following state.
-  simple_spinlock mutex_;
+  MutexType mutex_;
   size_t usage_;
 
   // Dummy head of recency list.
@@ -395,7 +397,7 @@ Cache::Handle* CacheShard<policy>::Lookup(const Slice& key,
                                           bool caching) {
   RLHandle* e;
   {
-    std::lock_guard<decltype(mutex_)> l(mutex_);
+    std::lock_guard<MutexType> l(mutex_);
     e = table_.Lookup(key, hash);
     if (e != nullptr) {
       e->refs.fetch_add(1, std::memory_order_relaxed);
@@ -435,7 +437,7 @@ Cache::Handle* CacheShard<policy>::Insert(
 
   RLHandle* to_remove_head = nullptr;
   {
-    std::lock_guard<decltype(mutex_)> l(mutex_);
+    std::lock_guard<MutexType> l(mutex_);
 
     RL_Append(handle);
 
@@ -475,7 +477,7 @@ void CacheShard<policy>::Erase(const Slice& key, uint32_t hash) {
   RLHandle* e;
   bool last_reference = false;
   {
-    std::lock_guard<decltype(mutex_)> l(mutex_);
+    std::lock_guard<MutexType> l(mutex_);
     e = table_.Remove(key, hash);
     if (e != nullptr) {
       RL_Remove(e);
@@ -496,7 +498,7 @@ size_t CacheShard<policy>::Invalidate(const Cache::InvalidationControl& ctl) {
   RLHandle* to_remove_head = nullptr;
 
   {
-    std::lock_guard<decltype(mutex_)> l(mutex_);
+    std::lock_guard<MutexType> l(mutex_);
 
     // rl_.next is the oldest (a.k.a. least relevant) entry in the recency list.
     RLHandle* h = rl_.next;
@@ -544,6 +546,29 @@ int DetermineShardBits() {
 
 template<Cache::EvictionPolicy policy>
 class ShardedCache : public Cache {
+ private:
+  shared_ptr<MemTracker> mem_tracker_;
+  unique_ptr<CacheMetrics> metrics_;
+  vector<CacheShard<policy>*> shards_;
+
+  // Number of bits of hash used to determine the shard.
+  const int shard_bits_;
+
+  // Protects 'metrics_'. Used only when metrics are set, to ensure
+  // that they are set only once in test environments.
+  MutexType metrics_lock_;
+
+  static inline uint32_t HashSlice(const Slice& s) {
+    return util_hash::CityHash64(
+      reinterpret_cast<const char *>(s.data()), s.size());
+  }
+
+  uint32_t Shard(uint32_t hash) {
+    // Widen to uint64 before shifting, or else on a single CPU,
+    // we would try to shift a uint32_t by 32 bits, which is undefined.
+    return static_cast<uint64_t>(hash) >> (32 - shard_bits_);
+  }
+
  public:
   explicit ShardedCache(size_t capacity, const string& id)
         : shard_bits_(DetermineShardBits()) {
@@ -567,12 +592,32 @@ class ShardedCache : public Cache {
     STLDeleteElements(&shards_);
   }
 
+  Handle* Insert(UniquePendingHandle handle,
+                 Cache::EvictionCallback* eviction_callback) override {
+    RLHandle* h = reinterpret_cast<RLHandle*>(DCHECK_NOTNULL(handle.release()));
+    return shards_[Shard(h->hash)]->Insert(h, eviction_callback);
+  }
+  Handle* Lookup(const Slice& key, CacheBehavior caching) override {
+    const uint32_t hash = HashSlice(key);
+    return shards_[Shard(hash)]->Lookup(key, hash, caching == EXPECT_IN_CACHE);
+  }
+  void Release(Handle* handle) override {
+    RLHandle* h = reinterpret_cast<RLHandle*>(handle);
+    shards_[Shard(h->hash)]->Release(handle);
+  }
+  void Erase(const Slice& key) override {
+    const uint32_t hash = HashSlice(key);
+    shards_[Shard(hash)]->Erase(key, hash);
+  }
+  Slice Value(Handle* handle) override {
+    return reinterpret_cast<RLHandle*>(handle)->value();
+  }
   void SetMetrics(std::unique_ptr<CacheMetrics> metrics) override {
     // TODO(KUDU-2165): reuse of the Cache singleton across multiple MiniCluster servers
     // causes TSAN errors. So, we'll ensure that metrics only get attached once, from
     // whichever server starts first. This has the downside that, in test builds, we won't
     // get accurate cache metrics, but that's probably better than spurious failures.
-    std::lock_guard<decltype(metrics_lock_)> l(metrics_lock_);
+    std::lock_guard<simple_spinlock> l(metrics_lock_);
     if (metrics_) {
       CHECK(IsGTest()) << "Metrics should only be set once per Cache singleton";
       return;
@@ -581,30 +626,6 @@ class ShardedCache : public Cache {
     for (auto* cache : shards_) {
       cache->SetMetrics(metrics_.get());
     }
-  }
-
-  UniqueHandle Lookup(const Slice& key, CacheBehavior caching) override {
-    const uint32_t hash = HashSlice(key);
-    return UniqueHandle(
-        shards_[Shard(hash)]->Lookup(key, hash, caching == EXPECT_IN_CACHE),
-        Cache::HandleDeleter(this));
-  }
-
-  void Erase(const Slice& key) override {
-    const uint32_t hash = HashSlice(key);
-    shards_[Shard(hash)]->Erase(key, hash);
-  }
-
-  Slice Value(const UniqueHandle& handle) const override {
-    return reinterpret_cast<const RLHandle*>(handle.get())->value();
-  }
-
-  UniqueHandle Insert(UniquePendingHandle handle,
-                      Cache::EvictionCallback* eviction_callback) override {
-    RLHandle* h = reinterpret_cast<RLHandle*>(DCHECK_NOTNULL(handle.release()));
-    return UniqueHandle(
-        shards_[Shard(h->hash)]->Insert(h, eviction_callback),
-        Cache::HandleDeleter(this));
   }
 
   UniquePendingHandle Allocate(Slice key, int val_len, int charge) override {
@@ -632,8 +653,13 @@ class ShardedCache : public Cache {
     return h;
   }
 
-  uint8_t* MutableValue(UniquePendingHandle* handle) override {
-    return reinterpret_cast<RLHandle*>(handle->get())->mutable_val_ptr();
+  void Free(PendingHandle* h) override {
+    uint8_t* data = reinterpret_cast<uint8_t*>(h);
+    delete [] data;
+  }
+
+  uint8_t* MutableValue(PendingHandle* h) override {
+    return reinterpret_cast<RLHandle*>(h)->mutable_val_ptr();
   }
 
   size_t Invalidate(const InvalidationControl& ctl) override {
@@ -643,40 +669,6 @@ class ShardedCache : public Cache {
     }
     return invalidated_count;
   }
-
- protected:
-  void Release(Handle* handle) override {
-    RLHandle* h = reinterpret_cast<RLHandle*>(handle);
-    shards_[Shard(h->hash)]->Release(handle);
-  }
-
-  void Free(PendingHandle* h) override {
-    uint8_t* data = reinterpret_cast<uint8_t*>(h);
-    delete [] data;
-  }
-
- private:
-  static inline uint32_t HashSlice(const Slice& s) {
-    return util_hash::CityHash64(
-      reinterpret_cast<const char *>(s.data()), s.size());
-  }
-
-  uint32_t Shard(uint32_t hash) {
-    // Widen to uint64 before shifting, or else on a single CPU,
-    // we would try to shift a uint32_t by 32 bits, which is undefined.
-    return static_cast<uint64_t>(hash) >> (32 - shard_bits_);
-  }
-
-  shared_ptr<MemTracker> mem_tracker_;
-  unique_ptr<CacheMetrics> metrics_;
-  vector<CacheShard<policy>*> shards_;
-
-  // Number of bits of hash used to determine the shard.
-  const int shard_bits_;
-
-  // Protects 'metrics_'. Used only when metrics are set, to ensure
-  // that they are set only once in test environments.
-  simple_spinlock metrics_lock_;
 };
 
 }  // end anonymous namespace

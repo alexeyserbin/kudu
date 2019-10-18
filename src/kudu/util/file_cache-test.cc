@@ -156,8 +156,10 @@ TYPED_TEST(FileCacheTest, TestBasicOperations) {
     ASSERT_OK(this->cache_->OpenExistingFile(kFile1, &f2));
     NO_FATALS(this->AssertFdsAndDescriptors(1, 1));
     {
-      auto uh(this->cache_->cache_->Lookup(kFile1, Cache::EXPECT_IN_CACHE));
-      ASSERT_TRUE(uh);
+      Cache::UniqueHandle uh(
+          this->cache_->cache_->Lookup(kFile1, Cache::EXPECT_IN_CACHE),
+          Cache::HandleDeleter(this->cache_->cache_.get()));
+      ASSERT_TRUE(uh.get());
     }
 
     // Open a second file. This will create a new descriptor, but evict the fd
@@ -166,12 +168,16 @@ TYPED_TEST(FileCacheTest, TestBasicOperations) {
     ASSERT_OK(this->cache_->OpenExistingFile(kFile2, &f3));
     NO_FATALS(this->AssertFdsAndDescriptors(1, 2));
     {
-      auto uh(this->cache_->cache_->Lookup(kFile1, Cache::EXPECT_IN_CACHE));
-      ASSERT_FALSE(uh);
+      Cache::UniqueHandle uh(
+          this->cache_->cache_->Lookup(kFile1, Cache::EXPECT_IN_CACHE),
+          Cache::HandleDeleter(this->cache_->cache_.get()));
+      ASSERT_FALSE(uh.get());
     }
     {
-      auto uh(this->cache_->cache_->Lookup(kFile2, Cache::EXPECT_IN_CACHE));
-      ASSERT_TRUE(uh);
+      Cache::UniqueHandle uh(
+          this->cache_->cache_->Lookup(kFile2, Cache::EXPECT_IN_CACHE),
+          Cache::HandleDeleter(this->cache_->cache_.get()));
+      ASSERT_TRUE(uh.get());
     }
   }
 
