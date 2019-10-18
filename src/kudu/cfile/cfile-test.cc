@@ -83,8 +83,8 @@ DECLARE_bool(force_block_cache_capacity);
 DECLARE_int64(block_cache_capacity_mb);
 
 #if defined(__linux__)
+DECLARE_double(nvm_cache_allocation_inject_failure);
 DECLARE_string(nvm_cache_path);
-DECLARE_bool(nvm_cache_simulate_allocation_failure);
 #endif
 
 METRIC_DECLARE_counter(block_cache_hits_caching);
@@ -748,6 +748,7 @@ TEST_P(TestCFileBothCacheMemoryTypes, TestReadWriteLargeStrings) {
     StringAppendF(&ret, "%010zd", val);
     return ret;
   };
+  FLAGS_nvm_cache_allocation_inject_failure = 0.3;
   TestReadWriteStrings(PLAIN_ENCODING, formatter);
   if (AllowSlowTests()) {
     TestReadWriteStrings(DICT_ENCODING, formatter);
@@ -1045,7 +1046,7 @@ TEST_P(TestCFileBothCacheMemoryTypes, TestCacheKeysAreStable) {
 // Inject failures in nvm allocation and ensure that we can still read a file.
 TEST_P(TestCFileBothCacheMemoryTypes, TestNvmAllocationFailure) {
   if (GetParam() != Cache::MemoryType::NVM) return;
-  FLAGS_nvm_cache_simulate_allocation_failure = true;
+  FLAGS_nvm_cache_allocation_inject_failure = 0.8;
   TestReadWriteFixedSizeTypes<UInt32DataGenerator<false> >(PLAIN_ENCODING);
 }
 #endif

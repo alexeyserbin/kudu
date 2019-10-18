@@ -46,8 +46,10 @@
 #include "kudu/gutil/sysinfo.h"
 #include "kudu/util/cache.h"
 #include "kudu/util/cache_metrics.h"
+#include "kudu/util/fault_injection.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/locks.h"
+#include "kudu/util/malloc.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/slice.h"
 
@@ -60,17 +62,18 @@ DEFINE_string(nvm_cache_path, "/pmem",
               "The path at which the NVM cache will try to allocate its memory. "
               "This can be a tmpfs or ramfs for testing purposes.");
 
-DEFINE_int32(nvm_cache_allocation_retry_count, 0,
+DEFINE_int32(nvm_cache_allocation_retry_count, 10,
              "The number of times that the NVM cache will retry attempts to allocate "
              "memory for new entries. In between attempts, a cache entry will be "
              "evicted.");
 TAG_FLAG(nvm_cache_allocation_retry_count, advanced);
 TAG_FLAG(nvm_cache_allocation_retry_count, experimental);
 
-DEFINE_bool(nvm_cache_simulate_allocation_failure, false,
-            "If true, the NVM cache will inject failures in calls to memkind_malloc "
-            "for testing.");
-TAG_FLAG(nvm_cache_simulate_allocation_failure, unsafe);
+DEFINE_double(nvm_cache_allocation_inject_failure, 0.0,
+              "Probability of NVM cache allocation failures while calling "
+              "memkind_malloc(); value <= 0 means no failure injection. "
+              "Used only for testing.");
+TAG_FLAG(nvm_cache_allocation_inject_failure, unsafe);
 
 using std::string;
 using std::unique_ptr;
@@ -255,9 +258,9 @@ class NvmLRUCache {
 };
 
 NvmLRUCache::NvmLRUCache(memkind* vmp)
-  : usage_(0),
-  vmp_(vmp),
-  metrics_(nullptr) {
+    : usage_(0),
+      vmp_(vmp),
+      metrics_(nullptr) {
   // Make empty circular linked list
   lru_.next = &lru_;
   lru_.prev = &lru_;
@@ -275,10 +278,11 @@ NvmLRUCache::~NvmLRUCache() {
 }
 
 void* NvmLRUCache::MemkindMalloc(size_t size) {
-  if (PREDICT_FALSE(FLAGS_nvm_cache_simulate_allocation_failure)) {
+  if (fault_injection::MaybeTrue(FLAGS_nvm_cache_allocation_inject_failure)) {
     return nullptr;
   }
-  return memkind_malloc(vmp_, size);
+  //return memkind_malloc(vmp_, size);
+  return malloc(size);
 }
 
 bool NvmLRUCache::Unref(LRUHandle* e) {
@@ -295,7 +299,8 @@ void NvmLRUCache::FreeEntry(LRUHandle* e) {
     metrics_->cache_usage->DecrementBy(e->charge);
     metrics_->evictions->Increment();
   }
-  memkind_free(vmp_, e);
+  free(e);
+  //memkind_free(vmp_, e);
 }
 
 // Allocate nvm memory. Try until successful or FLAGS_nvm_cache_allocation_retry_count
@@ -606,7 +611,8 @@ class ShardedLRUCache : public Cache {
         handle->val_length = val_len;
         handle->key_length = key_len;
         handle->charge = (charge == kAutomaticCharge) ?
-            memkind_malloc_usable_size(vmp_, buf) : charge;
+            //memkind_malloc_usable_size(vmp_, buf) : charge;
+            kudu_malloc_usable_size(buf) : charge;
         handle->hash = HashSlice(key);
         memcpy(handle->kv_data, key.data(), key.size());
         return ph;
@@ -617,7 +623,8 @@ class ShardedLRUCache : public Cache {
   }
 
   virtual void Free(PendingHandle* ph) OVERRIDE {
-    memkind_free(vmp_, ph);
+    free(ph);
+    //memkind_free(vmp_, ph);
   }
 
   size_t Invalidate(const InvalidationControl& ctl) override {
