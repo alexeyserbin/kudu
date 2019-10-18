@@ -92,10 +92,11 @@ class CacheBaseTest : public KuduTest,
   void Insert(int key, int value, int charge = 1) {
     std::string key_str = EncodeInt(key);
     std::string val_str = EncodeInt(value);
-    auto handle(cache_->Allocate(key_str, val_str.size(), charge));
-    CHECK(handle);
-    memcpy(cache_->MutableValue(handle.get()), val_str.data(), val_str.size());
-    cache_->Release(cache_->Insert(std::move(handle), this));
+    Cache::PendingHandle* handle = CHECK_NOTNULL(
+        cache_->Allocate(key_str, val_str.size(), charge));
+    memcpy(cache_->MutableValue(handle), val_str.data(), val_str.size());
+
+    cache_->Release(cache_->Insert(handle, this));
   }
 
   void Erase(int key) {

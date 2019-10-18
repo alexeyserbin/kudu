@@ -122,11 +122,13 @@ class BaseDescriptor {
     // The allocated charge is always one byte. This is incorrect with respect
     // to memory tracking, but it's necessary if the cache capacity is to be
     // equivalent to the max number of fds.
-    auto pending(cache()->Allocate(filename(), sizeof(file_ptr), 1));
-    CHECK(pending);
-    memcpy(cache()->MutableValue(pending.get()), &file_ptr, sizeof(file_ptr));
+    Cache::PendingHandle* pending = CHECK_NOTNULL(cache()->Allocate(
+        filename(), sizeof(file_ptr), 1));
+    memcpy(cache()->MutableValue(pending),
+           &file_ptr,
+           sizeof(file_ptr));
     return ScopedOpenedDescriptor<FileType>(this, Cache::UniqueHandle(
-        cache()->Insert(std::move(pending), file_cache_->eviction_cb_.get()),
+        cache()->Insert(pending, file_cache_->eviction_cb_.get()),
         Cache::HandleDeleter(cache())));
   }
 
