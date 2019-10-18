@@ -196,11 +196,11 @@ class TTLCache {
                   int charge = Cache::kAutomaticCharge) {
     auto pending(cache_->Allocate(key, sizeof(Entry), charge));
     CHECK(pending);
-    Entry* entry = reinterpret_cast<Entry*>(cache_->MutableValue(pending.get()));
+    Entry* entry = reinterpret_cast<Entry*>(cache_->MutableValue(pending));
     entry->val_ptr = val.get();
     entry->exp_time = MonoTime::Now() + entry_ttl_;
     // Insert() evicts already existing entry with the same key, if any.
-    Cache::UniqueHandle h(cache_->Insert(std::move(pending), eviction_cb_.get()),
+    Cache::UniqueHandle h(cache_->Insert(pending, eviction_cb_.get()),
                           Cache::HandleDeleter(cache_.get()));
     // The cache takes care of the entry from this point: deallocation of the
     // resources passed via 'val' parameter is performed by the eviction callback.
