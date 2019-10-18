@@ -21,6 +21,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -320,7 +321,9 @@ void *NvmLRUCache::AllocateAndRetry(size_t size) {
 
       // Unlock while allocating memory.
       l.unlock();
+      LOG(ERROR) << "AllocateAndRetry: BEFORE retry MemkindMalloc";
       tmp = MemkindMalloc(size);
+      LOG(ERROR) << "AllocateAndRetry: AFTER  retry MemkindMalloc";
       l.lock();
     }
   }
@@ -593,17 +596,33 @@ class ShardedLRUCache : public Cache {
     // this can cause eviction, so we might have better luck in different
     // shards.
     for (NvmLRUCache* cache : shards_) {
+      LOG(ERROR) << "BEFORE AllocateAndRetry:"
+                 << " key_len: " << key_len
+                 << " val_len: " << val_len
+                 << " key_len + val_len + sizeof(LRUHandle): "
+                 << key_len + val_len + sizeof(LRUHandle);
       uint8_t* buf = static_cast<uint8_t*>(cache->AllocateAndRetry(
           sizeof(LRUHandle) + key_len + val_len));
+      LOG(ERROR) << "AFTER AllocateAndRetry: "
+                 << (buf == nullptr ? "NULL" : "non-NULL");
       if (buf) {
+        LOG(ERROR) << "BEFORE setting data: buf addr "
+                   << std::hex << reinterpret_cast<uintptr_t>(buf);
         handle = reinterpret_cast<LRUHandle*>(buf);
+        LOG(ERROR) << "SETTING data 1";
         handle->kv_data = &buf[sizeof(LRUHandle)];
+        LOG(ERROR) << "SETTING data 2";
         handle->val_length = val_len;
+        LOG(ERROR) << "SETTING data 3";
         handle->key_length = key_len;
+        LOG(ERROR) << "SETTING data 4";
         handle->charge = (charge == kAutomaticCharge) ?
             memkind_malloc_usable_size(vmp_, buf) : charge;
+        LOG(ERROR) << "SETTING data 5";
         handle->hash = HashSlice(key);
+        LOG(ERROR) << "SETTING data 6";
         memcpy(handle->kv_data, key.data(), key.size());
+        LOG(ERROR) << "AFTER setting data";
         return reinterpret_cast<PendingHandle*>(handle);
       }
     }
